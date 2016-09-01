@@ -1,0 +1,155 @@
+#!/bin/sh
+
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+# based off of code from Juan M. Bello Rivas <jmbr@superadditive.com> and others
+
+#TODO connect to either pid or start exec
+prog_name="gdb_to_call_scope"
+
+# Usage
+if [ $# -lt 1 ]; then
+    echo "Usage: $prog_name PID"
+    echo
+    echo "Example: $prog_name -e ./app 123"
+    exit 1
+fi
+
+# Sanity check - does executable file exist
+PID=$1
+
+# Sanity check - verify executable has debugging enabled
+if [ $1 -eq '-e' ]; then
+	LANG="" gdb --eval-command=quit $PID 2>&1 \
+		| grep -E '(no\ debugging\ symbols\ found|not\ in\ executable\ format)' 2>&1 > /dev/null
+	if [ $? -eq 0 ]; then
+		echo -n "$prog_name: Can't print call graph for '$PID' because it's not a "
+		echo "binary executable compiled with debugging symbols."
+		exit 1;
+	fi
+fi
+
+shift
+
+# Set up temporary files.
+TRACE="`mktemp -t $prog_name.XXXXXXXXXX`" || exit
+GETFUNCS="`mktemp -t $prog_name.XXXXXXXXXX`" || exit
+
+trap 'rm -f -- "$TRACE" "$GETFUNCS"' EXIT
+trap 'trap - EXIT; rm -f -- "$TRACE" "$GETFUNCS"; exit 1' HUP INT QUIT TERM
+
+# Take control of GDB and print call graph.
+
+# get all function names when in gdb
+cat > $GETFUNCS <<EOF
+set height 0
+info functions
+EOF
+
+# using all function names, create $TRACE script that set breakpoints in gdb on each and run with backtrace
+# TODO cache since reusable
+echo "getting function names"
+gdb --batch --command=$GETFUNCS --pid=$PID  | awk '
+function get_func_name(str)
+{
+  split(str, part, "(");
+  len = split(part[1], part, " ");
+  len = split(part[len], part, "*");
+
+  return part[len];
+}
+
+BEGIN {
+  total = 0;
+  print "set width 0";
+  print "set height 0";
+  print "set verbose off";
+}
+
+/[a-zA-Z_][a-zA-Z0-9_]*\(/ {
+  fn = get_func_name($0);
+  printf("break %s\n", fn);
+  ++total;
+}
+
+END {
+  for (i = 1; i <= total; i++) {
+    print "commands", i;
+    /* print "info args"; */
+    print "backtrace 2";
+    print "continue";
+    print "end";
+  }
+
+  print "set confirm off"
+  print "quit"
+}
+' > $TRACE
+
+# start up gdb again, this time get the actual data.  Then format the data (on completion?)
+echo "setting traces and saving results"
+# gdb --batch --command=$TRACE --tty=/dev/null --args $PID $@ 2>/dev/null | awk '
+gdb --batch --command=$TRACE --tty=/dev/null --args $PID $@  | awk '
+function get_callee(s)
+{
+  split(s, info, ",");
+  split(info[2], fn, " ");
+  callee = fn[1];
+
+  return callee;
+}
+
+function get_params(s, n)
+{
+  split(s, par, n);
+  split(par[2], par, " at ");
+  sub(/ \(/, "(", par[1]);
+
+  return par[1];
+}
+
+BEGIN {
+  isrecord = 0;
+  callee = "";
+  caller = "*INITIAL*";
+  params = "";
+}
+
+/^Breakpoint [0-9]+,/ {
+  isrecord = 1;
+
+  callee = get_callee($0);
+  params = get_params($0, callee);
+}
+
+/^#1[ \t]+/ {
+  if (isrecord)
+    caller = $4;
+}
+
+/^$/ {
+  if (isrecord && (caller != "*INITIAL*")) {
+    printf("%s %s %s\n", caller, callee, params);
+    callee = caller = params = "";
+  }
+}
+'
